@@ -163,6 +163,7 @@
   <ItemGroup>
     <ClCompile Include="..\libmodbus\ModbusCVD.cpp" />
     <ClCompile Include="calculatecommand.cpp" />
+    <ClCompile Include="click_move.cpp" />
     <ClCompile Include="crc16ibm.cpp" />
     <ClCompile Include="get_create_image.cpp" />
     <ClCompile Include="main_oshima.cpp" />
@@ -180,6 +181,7 @@
     <ClInclude Include="Function.h" />
     <ClInclude Include="get_create_image.h" />
     <ClInclude Include="microsupportcommand.hpp" />
+    <ClInclude Include="click_move.h" />
     <ClInclude Include="OpenCVConfig.h" />
     <ClInclude Include="crc16ibm.h" />
     <ClInclude Include="phantom_command2.h" />

@@ -42,6 +42,7 @@ std::mt19937 gen(rd());
 //xbox
 #include <Xinput.h>
 #include "microsupportcommand.hpp"
+#include "click_move.h"	//クリック移動（通常視野クリック→インジェクションピペット移動）
 #pragma comment(lib,"winmm.lib")			
 #pragma comment(lib, "xinput.lib")
 
@@ -2004,6 +2005,145 @@ void CallBackFunc(int eventType, int x, int y, int flags, void* userdata)
 	ptr->y = y;
 	ptr->event = eventType;
 	ptr->flags = flags;
+}
+
+//==================== クリック移動（通常視野 circle_img） ====================
+// T + 左クリック : 目標点を設定
+// Enter          : 操作中のインジェクションピペット（move_mode 2→man1/RU, 1→man3/RD）を目標点へ XY 移動（Z は固定）
+// X              : 目標をクリア / 移動中なら停止
+mouseParam g_circleMouse = { 0, 0, -1, 0 };		//circle_img の最新のクリック（判定後に event を -1 に戻す）
+std::atomic<bool> g_click_target_set{ false };	//目標点が設定されているか
+std::atomic<bool> g_click_move_busy{ false };	//クリック移動の実行中
+std::atomic<bool> g_click_move_abort{ false };	//移動中止の要求
+double g_click_target_px[2] = { 0, 0 };			//目標点（circle_img の画素座標）
+const double CLICK_MOVE_SPEED = 300.0;			//移動速度 [um/s]（既定の s=1000 より遅め）
+const double CLICK_MOVE_MAX_DIST = 1000.0;		//これより遠い目標は拒否 [um]
+const double CLICK_MOVE_TOLERANCE = 1.0;		//到達判定 [um]
+
+//circle_img のマウスコールバック（既存の 1～4＋クリックの先端補正と、T＋クリックの目標設定）
+void CircleImgMouseCallback(int eventType, int x, int y, int flags, void* userdata)
+{
+	if (eventType != cv::EVENT_LBUTTONDOWN) return;	//マウス移動で上書きされないよう、左クリックだけ記録する
+
+	g_circleMouse.x = x;
+	g_circleMouse.y = y;
+	g_circleMouse.event = eventType;
+	g_circleMouse.flags = flags;
+
+	if ((GetAsyncKeyState(0x54) & 0x8000) && !g_click_move_busy) {	//T キー
+		g_click_target_px[0] = x;
+		g_click_target_px[1] = y;
+		g_click_target_set = true;
+		printf("[クリック移動] 目標点を設定 (u, v) = (%d, %d)  Enter で移動 / X でクリア\n", x, y);
+	}
+}
+
+//目標画素 (u, v) へ操作中のインジェクションピペットを XY 移動する（別スレッドで実行）
+//mode : 2 → man1(RU)、1 → man3(RD)
+void clickMoveExecute(double u, double v, int mode)
+{
+	const bool is_man1 = (mode == 2);
+	HANDLE dev = is_man1 ? hDevice_RU : hDevice_RD;
+	const char* name = is_man1 ? "man1(RU)" : "man3(RD)";
+	Mat& rvec = is_man1 ? rvec1 : rvec3;
+	Mat& tvec = is_man1 ? tvec1 : tvec3;
+	const double tip_dx = is_man1 ? man1_dx : man3_dx;
+	const double tip_dy = is_man1 ? man1_dy : man3_dy;
+	double& xw = is_man1 ? man1_xw : man3_xw;
+	double& yw = is_man1 ? man1_yw : man3_yw;
+	double& zw = is_man1 ? man1_zw : man3_zw;
+	double& xw0 = is_man1 ? man1_xw0 : man3_xw0;
+	double& yw0 = is_man1 ? man1_yw0 : man3_yw0;
+	double& zw0 = is_man1 ? man1_zw0 : man3_zw0;
+	Mat& pos3D = is_man1 ? man1_pos3D : man3_pos3D;
+
+	//Phantom / Xbox からの指令を止める（A キーのシーケンスと同じ手順）
+	const int saved_move_mode = move_mode;
+	const int saved_move_flag = move_flag;
+	move_flag = 0;
+	move_mode = 0;
+	sleep(50);
+
+	double x0, y0, z0;
+	Getposition(dev, x0, y0, z0);
+
+	double xt = 0, yt = 0;
+	bool ok = click_move::pixelToWorldFixedZ(u, v, z0, rvec, tvec, K, tip_dx, tip_dy, xt, yt);
+	const double dx = xt - x0;
+	const double dy = yt - y0;
+	const double dist = sqrt(dx * dx + dy * dy);
+
+	if (!ok) {
+		printf("[クリック移動] %s: 座標変換に失敗したため移動しません\n", name);
+	}
+	else {
+		const double err = click_move::reprojectError(u, v, xt, yt, z0, rvec, tvec, K, tip_dx, tip_dy);
+		printf("[クリック移動] %s: 現在 (%.1f, %.1f, %.1f) -> 目標 (%.1f, %.1f, %.1f) um  移動量 %.1f um  再投影誤差 %.3f px\n",
+			name, x0, y0, z0, xt, yt, z0, dist, err);
+		if (dist > CLICK_MOVE_MAX_DIST) {
+			printf("[クリック移動] 移動量が上限 %.0f um を超えるため移動しません\n", CLICK_MOVE_MAX_DIST);
+			ok = false;
+		}
+	}
+
+	bool aborted = false;
+	if (ok && dist >= 0.05) {	//0.05 um = 1 パルス未満は動かさない
+		std::vector<double> spd{ CLICK_MOVE_SPEED, CLICK_MOVE_SPEED, CLICK_MOVE_SPEED };
+		std::vector<double> amount{ dx, dy, 0.0 };	//Z は動かさない（Moveto は量 0 の軸を停止のままにする）
+		Moveto(dev, spd, amount);
+
+		const double timeout_ms = dist / CLICK_MOVE_SPEED * 1000.0 + 2000.0;
+		double elapsed = 0;
+		bool reached = false;
+		while (elapsed < timeout_ms) {
+			elapsed += sleep(5);
+			double cx_now, cy_now, cz_now;
+			Getposition(dev, cx_now, cy_now, cz_now);
+			pos3D.at<double>(0, 0) = cx_now;	//緑の先端マーカーを移動中も追従させる
+			pos3D.at<double>(0, 1) = -cy_now;
+			pos3D.at<double>(0, 2) = cz_now;
+
+			if (g_click_move_abort || (GetAsyncKeyState(0x58) & 0x8000)) {	//X キーで停止
+				DriveStop(dev);
+				aborted = true;
+				printf("[クリック移動] 停止しました\n");
+				break;
+			}
+			const double ex = xt - cx_now;
+			const double ey = yt - cy_now;
+			if (sqrt(ex * ex + ey * ey) <= CLICK_MOVE_TOLERANCE) {
+				reached = true;
+				break;
+			}
+		}
+		if (!reached && !aborted) {
+			DriveStop(dev);
+			printf("[クリック移動] タイムアウトのため停止しました\n");
+		}
+		sleep(50);
+	}
+
+	//最終位置を設定値に反映し、Phantom のオフセットを取り直す（再開時に跳ね戻らないように）
+	double xf, yf, zf;
+	Getposition(dev, xf, yf, zf);
+	xw = xf;
+	yw = yf;
+	zw = zf;
+	pos3D.at<double>(0, 0) = xf;
+	pos3D.at<double>(0, 1) = -yf;
+	pos3D.at<double>(0, 2) = zf;
+	xw0 = xw - (pPosition2[0] * Kp_pha);
+	yw0 = yw - (-pPosition2[2] * Kp_pha);
+	zw0 = zw - (pPosition2[1] * Kp_pha_z);
+	if (ok && !aborted) {
+		printf("[クリック移動] %s: 到達 (%.1f, %.1f, %.1f) um  残差 %.1f um\n", name, xf, yf, zf, sqrt((xt - xf) * (xt - xf) + (yt - yf) * (yt - yf)));
+	}
+
+	move_mode = saved_move_mode;
+	move_flag = saved_move_flag;
+	g_click_target_set = false;
+	g_click_move_abort = false;
+	g_click_move_busy = false;
 }
 
 double EdgeCaluculation(Mat src, int center_x, int center_y, int radius)
@@ -5440,9 +5580,11 @@ unsigned __stdcall mythread7(LPVOID lpx)
 		if ((lastdirection_l[0] - direction_l[0]) != 0)	McsdDriveStop(hDevice_move_l, 0, 0);
 		if ((lastdirection_l[1] - direction_l[1]) != 0)	McsdDriveStop(hDevice_move_l, 1, 0);
 		if ((lastdirection_l[2] - direction_l[2]) != 0)	McsdDriveStop(hDevice_move_l, 2, 0);
-		if ((lastdirection_r[0] - direction_r[0]) != 0)	McsdDriveStop(hDevice_move_r, 0, 0);
-		if ((lastdirection_r[1] - direction_r[1]) != 0)	McsdDriveStop(hDevice_move_r, 1, 0);
-		if ((lastdirection_r[2] - direction_r[2]) != 0)	McsdDriveStop(hDevice_move_r, 2, 0);
+		if (!g_click_move_busy) {	//クリック移動中は右側のマニピュレータに指令を出さない
+			if ((lastdirection_r[0] - direction_r[0]) != 0)	McsdDriveStop(hDevice_move_r, 0, 0);
+			if ((lastdirection_r[1] - direction_r[1]) != 0)	McsdDriveStop(hDevice_move_r, 1, 0);
+			if ((lastdirection_r[2] - direction_r[2]) != 0)	McsdDriveStop(hDevice_move_r, 2, 0);
+		}
 
 
 		//past_man1_xw = man1_xw;
@@ -5479,7 +5621,7 @@ unsigned __stdcall mythread7(LPVOID lpx)
 		}
 
 		if (use == 2) {
-			Go(hDevice_move_r, speed_r);
+			if (!g_click_move_busy) Go(hDevice_move_r, speed_r);	//クリック移動中は Xbox の指令を止める（速度0の Go は DriveStop になるため）
 			lastdirection_r[0] = direction_r[0];
 			lastdirection_r[1] = direction_r[1];
 			lastdirection_r[2] = direction_r[2];
@@ -6156,7 +6298,7 @@ unsigned __stdcall mythread9(LPVOID lpx) {
 	for (;;) {
 		QueryPerformanceCounter(&loop_st);
 
-		if (use == 1) {
+		if (use == 1 && !g_click_move_busy) {	//クリック移動中は Phantom の指令を出さない
 
 			if (move_mode == 1) {
 				pvel_x = abs((man3_xw - past_man3_xw) * 11.0);
@@ -9084,9 +9226,13 @@ void multithread_controll() {
 				man4_flag = point_number + 2;
 			}
 
+			//circle_img のマウス入力（グローバルの g_circleMouse に記録する。T＋クリックはクリック移動の目標設定）
+			//以前はループ内のローカル変数を登録していたため、クリックを正しく受け取れていなかった
+			setMouseCallback("circle_img", CircleImgMouseCallback, NULL);
+			mouseParam mouse = g_circleMouse;
+			g_circleMouse.event = -1;	//同じクリックを次のループで再判定しない
+
 			//man1の先端位置の修正（１ボタン＆circle_imgの先端を左クリック）
-			mouseParam mouse;
-			setMouseCallback("circle_img", CallBackFunc, &mouse);
 			if (man1_flag >= point_number + 1 && GetAsyncKeyState(0x31) && mouse.event == cv::EVENT_LBUTTONDOWN) {
 				man1_dx = mouse.x - man1_pos2D.at<double>(0, 0);
 				man1_dy = mouse.y - man1_pos2D.at<double>(0, 1);
@@ -9169,6 +9315,15 @@ void multithread_controll() {
 				//printf("x,y=%f  ,%f\n", man1_cpos[0], man1_cpos[1]);
 				//printf("cam1(zc,zc0,dWD,dWD0)=(%f,%f,%f,%f)\n", man1_zc, man1_zc0, man1_s_dWD2, s_dWD_0);
 				//printf("cam(x1,y1,z1,z1_2,i)=(%f,%f,%f,%f,%d)\n", man1_cpos[0], man1_cpos[1], man1_cpos[2], man1_zc2, man1_flag);
+			}
+
+			//man3の３次元座標をカメラ座標系に変換（通常視野でも man3 の先端位置を計算する。拡張視野側と同じ処理）
+			if (man3_flag == point_number + 2) {
+				projectPoints(man3_pos3D, rvec3, tvec3, K, distortion, man3_pos2D);
+				man3_cpos[0] = man3_pos2D.at<double>(0, 0) + man3_dx;
+				man3_cpos[1] = man3_pos2D.at<double>(0, 1) + man3_dy;
+				man3_zc = rmat3.at<double>(2, 2) * man3_pos3D.at<double>(0, 2) + tvec3.at<double>(2, 0);
+				man3_cpos[2] = (man3_zc - man3_zc0 + (man3_s_dWD2 - s_dWD_0) * 1000) / pixelpitch * magnification;
 			}
 
 			//man2の３次元座標をカメラ座標系に変換
@@ -9511,6 +9666,67 @@ void multithread_controll() {
 			}
 			// ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 			//追加ここまで
+
+			//==================== クリック移動：目標の表示と Enter / X の判定 ====================
+			{
+				static bool click_prev_enter = false;
+				const bool click_enter_now = (GetAsyncKeyState(VK_RETURN) & 0x8000) != 0;
+
+				//X キー：移動中なら停止、そうでなければ目標をクリア
+				if (GetAsyncKeyState(0x58) & 0x8000) {
+					if (g_click_move_busy) {
+						g_click_move_abort = true;
+					}
+					else if (g_click_target_set) {
+						g_click_target_set = false;
+						printf("[クリック移動] 目標をクリアしました\n");
+					}
+				}
+
+				const int click_mode = g_click_move_busy ? -1 : move_mode;	//移動中は move_mode=0 になっているので表示用に使わない
+				if (g_click_target_set) {
+					cv::Point tp((int)g_click_target_px[0], (int)g_click_target_px[1]);
+					cv::drawMarker(circle_img, tp, cv::Scalar(0, 0, 0), cv::MARKER_CROSS, 31, 5);
+					cv::drawMarker(circle_img, tp, cv::Scalar(255, 255, 255), cv::MARKER_CROSS, 27, 2);
+
+					std::string label = g_click_move_busy ? "MOVING" : "TARGET";
+					if (click_mode == 1 || click_mode == 2) {
+						const bool m1 = (click_mode == 2);
+						double* cpos = m1 ? man1_cpos : man3_cpos;
+						Mat& p3 = m1 ? man1_pos3D : man3_pos3D;
+						cv::line(circle_img, cv::Point((int)cpos[0], (int)cpos[1]), tp, cv::Scalar(255, 255, 255), 1);
+						double xt, yt;
+						if ((m1 ? man1_flag : man3_flag) == point_number + 2 &&
+							click_move::pixelToWorldFixedZ(g_click_target_px[0], g_click_target_px[1], p3.at<double>(0, 2),
+								m1 ? rvec1 : rvec3, m1 ? tvec1 : tvec3, K, m1 ? man1_dx : man3_dx, m1 ? man1_dy : man3_dy, xt, yt)) {
+							const double ddx = xt - p3.at<double>(0, 0);
+							const double ddy = yt - (-p3.at<double>(0, 1));
+							char buf[64];
+							sprintf_s(buf, " %s %.0f um", m1 ? "man1" : "man3", sqrt(ddx * ddx + ddy * ddy));
+							label += buf;
+						}
+					}
+					cv::putText(circle_img, label, tp + cv::Point(18, -12), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 0, 0), 4);
+					cv::putText(circle_img, label, tp + cv::Point(18, -12), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 255, 255), 1);
+				}
+
+				//Enter キー（押した瞬間だけ）：移動開始
+				if (click_enter_now && !click_prev_enter && g_click_target_set && !g_click_move_busy) {
+					const int mode = move_mode;
+					if (mode != 1 && mode != 2) {
+						printf("[クリック移動] 操作中のインジェクションピペットがありません (move_mode=%d)\n", mode);
+					}
+					else if ((mode == 2 ? man1_flag : man3_flag) != point_number + 2) {
+						printf("[クリック移動] %s のキャリブレーションが未完了のため移動できません\n", mode == 2 ? "man1" : "man3");
+					}
+					else {
+						g_click_move_abort = false;
+						g_click_move_busy = true;	//二重起動防止のため、スレッド起動前に立てる
+						std::thread(clickMoveExecute, g_click_target_px[0], g_click_target_px[1], mode).detach();
+					}
+				}
+				click_prev_enter = click_enter_now;
+			}
 
 			imshow("circle_img", circle_img);
 			waitKey(1);
