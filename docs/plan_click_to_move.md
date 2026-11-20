@@ -89,10 +89,14 @@ const double CLICK_MOVE_MAX_DIST = 1000.0; // µm、これを超える移動は�
 3. `Getposition(dev, x0,y0,z0)` で現在位置を取得します。`pixelToWorldFixedZ(target_px, z0, …)` で `(xt,yt)` を求めます。
    - 移動量が `CLICK_MOVE_MAX_DIST` を超えるときや計算に失敗したときは、移動せずにフラグを戻して終了します。
    - コンソールに現在位置、目標位置、移動量、再投影誤差を出力します。
-4. `Movepos(dev, {SPEED,SPEED,SPEED}, {xt, yt, z0})` を呼びます。Z は移動量0なので、その軸は停止のままです。
-5. 5 ms ごとに `Getposition` で確認し、次のどれかで終了します。
-   - 誤差が 1 µm 以下になった
-   - タイムアウト（`距離/SPEED + 2 s`）
+4. **近づき方は「縦（Y 軸）→ 横（X 軸）」の2段階**です（ユーザーの指定）。
+   1. `Moveto(dev, SPEED, {0, yt − y, 0})` で Y だけを動かし、到達を待ちます。
+   2. 現在位置を読み直してから `Moveto(dev, SPEED, {xt − x, 0, 0})` で X だけを動かし、到達を待ちます。X はピペットの軸方向です。
+   - Z と、動かさない方の軸は移動量 0 なので、停止したままです。
+   - 画面上では、予定経路を「先端 → 角 → 目標」の L 字で表示します。
+5. 各段階で 5 ms ごとに `Getposition` を呼んで確認し、次のどれかで終了します。
+   - その軸の誤差が 1 µm 以下になった
+   - タイムアウト（`その軸の移動量/SPEED + 2 s`）
    - `g_click_move_abort` または X キー → `DriveStop(dev)`
 6. 最終位置で `man*_xw/yw/zw` を更新します。`man*_xw0 = xw - pPosition[0]*Kp_pha`、`yw0 = yw - (-pPosition[2]*Kp_pha)`、`zw0 = zw - pPosition[1]*Kp_pha_z` とし、Phantom に戻ったときに跳ね戻らないようにします。
 7. `move_mode`/`move_flag` を元に戻し、`g_click_move_busy=false`、`g_click_target_set=false` にします。

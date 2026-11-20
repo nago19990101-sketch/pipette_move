@@ -19,6 +19,11 @@ namespace click_move {
 		double tip_dx, double tip_dy,
 		double& xw, double& yw);
 
+	// マニピュレータ座標 (xw, yw, zw) を circle_img の画素 (u, v) に変換する（既存の正変換と同じ）
+	cv::Point2d worldToPixel(double xw, double yw, double zw,
+		const cv::Mat& rvec, const cv::Mat& tvec, const cv::Mat& K,
+		double tip_dx, double tip_dy);
+
 	// (xw, yw, zw) を正変換で画素に戻し、(u, v) とのずれ [px] を返す（検算用）
 	double reprojectError(double u, double v, double xw, double yw, double zw,
 		const cv::Mat& rvec, const cv::Mat& tvec, const cv::Mat& K,

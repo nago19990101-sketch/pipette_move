@@ -2086,38 +2086,52 @@ void clickMoveExecute(double u, double v, int mode)
 		}
 	}
 
-	bool aborted = false;
-	if (ok && dist >= 0.05) {	//0.05 um = 1 パルス未満は動かさない
+	//1軸だけを目標値まで動かし、到達を待つ（axis: 0=X, 1=Y）
+	//戻り値 0:到達  1:停止（X キー）  2:タイムアウト
+	auto moveAxisAndWait = [&](int axis, double target) -> int {
+		double p[3];
+		Getposition(dev, p[0], p[1], p[2]);
+		const double amount_ax = target - p[axis];
+		if (fabs(amount_ax) < 0.05) return 0;	//0.05 um = 1 パルス未満は動かさない
+
 		std::vector<double> spd{ CLICK_MOVE_SPEED, CLICK_MOVE_SPEED, CLICK_MOVE_SPEED };
-		std::vector<double> amount{ dx, dy, 0.0 };	//Z は動かさない（Moveto は量 0 の軸を停止のままにする）
+		std::vector<double> amount{ 0.0, 0.0, 0.0 };	//量 0 の軸（Z と、もう一方の軸）は Moveto が停止のままにする
+		amount[axis] = amount_ax;
 		Moveto(dev, spd, amount);
 
-		const double timeout_ms = dist / CLICK_MOVE_SPEED * 1000.0 + 2000.0;
+		const double timeout_ms = fabs(amount_ax) / CLICK_MOVE_SPEED * 1000.0 + 2000.0;
 		double elapsed = 0;
-		bool reached = false;
 		while (elapsed < timeout_ms) {
 			elapsed += sleep(5);
-			double cx_now, cy_now, cz_now;
-			Getposition(dev, cx_now, cy_now, cz_now);
-			pos3D.at<double>(0, 0) = cx_now;	//緑の先端マーカーを移動中も追従させる
-			pos3D.at<double>(0, 1) = -cy_now;
-			pos3D.at<double>(0, 2) = cz_now;
+			Getposition(dev, p[0], p[1], p[2]);
+			pos3D.at<double>(0, 0) = p[0];	//緑の先端マーカーを移動中も追従させる
+			pos3D.at<double>(0, 1) = -p[1];
+			pos3D.at<double>(0, 2) = p[2];
 
 			if (g_click_move_abort || (GetAsyncKeyState(0x58) & 0x8000)) {	//X キーで停止
 				DriveStop(dev);
-				aborted = true;
-				printf("[クリック移動] 停止しました\n");
-				break;
+				return 1;
 			}
-			const double ex = xt - cx_now;
-			const double ey = yt - cy_now;
-			if (sqrt(ex * ex + ey * ey) <= CLICK_MOVE_TOLERANCE) {
-				reached = true;
-				break;
-			}
+			if (fabs(target - p[axis]) <= CLICK_MOVE_TOLERANCE) return 0;
 		}
-		if (!reached && !aborted) {
-			DriveStop(dev);
+		DriveStop(dev);
+		return 2;
+	};
+
+	bool aborted = false;
+	if (ok && dist >= 0.05) {
+		//近づき方：縦（Y 軸）を先に合わせ、そのあと横（X 軸＝ピペットの軸方向）を合わせる
+		printf("[クリック移動] 縦（Y）移動 %.1f um → 横（X）移動 %.1f um\n", dy, dx);
+		int result = moveAxisAndWait(1, yt);
+		if (result == 0) {
+			sleep(50);
+			result = moveAxisAndWait(0, xt);
+		}
+		if (result == 1) {
+			aborted = true;
+			printf("[クリック移動] 停止しました\n");
+		}
+		else if (result == 2) {
 			printf("[クリック移動] タイムアウトのため停止しました\n");
 		}
 		sleep(50);
@@ -9694,16 +9708,25 @@ void multithread_controll() {
 						const bool m1 = (click_mode == 2);
 						double* cpos = m1 ? man1_cpos : man3_cpos;
 						Mat& p3 = m1 ? man1_pos3D : man3_pos3D;
-						cv::line(circle_img, cv::Point((int)cpos[0], (int)cpos[1]), tp, cv::Scalar(255, 255, 255), 1);
+						const cv::Point tip((int)cpos[0], (int)cpos[1]);
 						double xt, yt;
 						if ((m1 ? man1_flag : man3_flag) == point_number + 2 &&
 							click_move::pixelToWorldFixedZ(g_click_target_px[0], g_click_target_px[1], p3.at<double>(0, 2),
 								m1 ? rvec1 : rvec3, m1 ? tvec1 : tvec3, K, m1 ? man1_dx : man3_dx, m1 ? man1_dy : man3_dy, xt, yt)) {
-							const double ddx = xt - p3.at<double>(0, 0);
-							const double ddy = yt - (-p3.at<double>(0, 1));
+							const double x_now = p3.at<double>(0, 0);
+							const double y_now = -p3.at<double>(0, 1);
+							//予定経路を L 字で表示：先端 →（縦＝Y 移動）→ 角 →（横＝X 移動）→ 目標
+							const cv::Point2d corner = click_move::worldToPixel(x_now, yt, p3.at<double>(0, 2),
+								m1 ? rvec1 : rvec3, m1 ? tvec1 : tvec3, K, m1 ? man1_dx : man3_dx, m1 ? man1_dy : man3_dy);
+							const cv::Point cp((int)corner.x, (int)corner.y);
+							cv::line(circle_img, tip, cp, cv::Scalar(255, 255, 255), 1);
+							cv::line(circle_img, cp, tp, cv::Scalar(255, 255, 255), 1);
 							char buf[64];
-							sprintf_s(buf, " %s %.0f um", m1 ? "man1" : "man3", sqrt(ddx * ddx + ddy * ddy));
+							sprintf_s(buf, " %s Y%+.0f X%+.0f um", m1 ? "man1" : "man3", yt - y_now, xt - x_now);
 							label += buf;
+						}
+						else {
+							cv::line(circle_img, tip, tp, cv::Scalar(255, 255, 255), 1);
 						}
 					}
 					cv::putText(circle_img, label, tp + cv::Point(18, -12), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 0, 0), 4);

@@ -40,16 +40,24 @@ namespace click_move {
 		return true;
 	}
 
+	cv::Point2d worldToPixel(double xw, double yw, double zw,
+		const cv::Mat& rvec, const cv::Mat& tvec, const cv::Mat& K,
+		double tip_dx, double tip_dy)
+	{
+		std::vector<cv::Point3d> obj{ cv::Point3d(xw, -yw, zw) };	//man*_pos3D と同じく y を反転
+		std::vector<cv::Point2d> img;
+		cv::Mat dist = cv::Mat::zeros(4, 1, CV_64F);
+		cv::projectPoints(obj, rvec, tvec, K, dist, img);
+		return cv::Point2d(img[0].x + tip_dx, img[0].y + tip_dy);
+	}
+
 	double reprojectError(double u, double v, double xw, double yw, double zw,
 		const cv::Mat& rvec, const cv::Mat& tvec, const cv::Mat& K,
 		double tip_dx, double tip_dy)
 	{
-		std::vector<cv::Point3d> obj{ cv::Point3d(xw, -yw, zw) };
-		std::vector<cv::Point2d> img;
-		cv::Mat dist = cv::Mat::zeros(4, 1, CV_64F);
-		cv::projectPoints(obj, rvec, tvec, K, dist, img);
-		const double du = img[0].x + tip_dx - u;
-		const double dv = img[0].y + tip_dy - v;
+		const cv::Point2d p = worldToPixel(xw, yw, zw, rvec, tvec, K, tip_dx, tip_dy);
+		const double du = p.x - u;
+		const double dv = p.y - v;
 		return std::sqrt(du * du + dv * dv);
 	}
 
