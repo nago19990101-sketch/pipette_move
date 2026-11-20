@@ -816,15 +816,30 @@ int g_step_speed = 100;
 int g_step_speed_2 = 100;
 // 移動速度
 
+// 【一時的な設定】true: Modbus（自動インジェクタのモータ）がつながらないと終了する（元の動作）
+//                false: 警告を出すだけで起動を続け、モータ操作は無視する
+const bool MODBUS_REQUIRED = false;
+
+// モータが未接続（nullptr）なら警告を出して false を返す
+bool modbusMotorAvailable(ModbusCVD* motor, const std::string& motorName) {
+	if (motor == nullptr) {
+		std::cerr << "[警告] Modbus 未接続のため " << motorName << " は動かしません" << std::endl;
+		return false;
+	}
+	return true;
+}
+
 // モーターを動かす・停止するためのラッパー関数
-void move(ModbusCVD& motor, int speed, int direction, const std::string& motorName) {
-	if (!motor.moveMotor(speed, direction, motorName)) {
+void move(ModbusCVD* motor, int speed, int direction, const std::string& motorName) {
+	if (!modbusMotorAvailable(motor, motorName)) return;
+	if (!motor->moveMotor(speed, direction, motorName)) {
 		std::cerr << "Failed to control " << motorName << std::endl;
 	}
 }
 
-void stop(ModbusCVD& motor, const std::string& motorName) {
-	if (!motor.stopMotor()) {
+void stop(ModbusCVD* motor, const std::string& motorName) {
+	if (!modbusMotorAvailable(motor, motorName)) return;
+	if (!motor->stopMotor()) {
 		std::cerr << "Failed to stop " << motorName << std::endl;
 	}
 }
@@ -885,24 +900,25 @@ int getInputValueFromConsole(const std::string& promptName, int currentValue) {
 }
 // 相対位置決め運転（指定ステップ数だけ移動）を行う関数
 // steps: 正の値で正転、負の値で逆転
-void moveStepRelative(ModbusCVD& motor, int steps, int speed, const std::string& motorName) {
+void moveStepRelative(ModbusCVD* motor, int steps, int speed, const std::string& motorName) {
+	if (!modbusMotorAvailable(motor, motorName)) return;
 	printf("[%s] - Starting relative move: %d steps at speed %d...\n", motorName.c_str(), steps, speed);
 
 	// 1. アラームが出ていたらリセット
-	if (!motor.resetAlarm()) {
+	if (!motor->resetAlarm()) {
 		std::cerr << motorName << " - Failed to reset alarm." << std::endl;
 		return;
 	}
 
 	// 2. FREE（脱磁）状態を解除して、モータを動かせる状態（励磁）にする
-	if (!motor.free(false)) {
+	if (!motor->free(false)) {
 		std::cerr << motorName << " - Failed to enable motor (free off)." << std::endl;
 		return;
 	}
 
 	// 3. ModbusCVD.cpp の startPosition を呼び出す
 	// 第3引数の "2" は相対位置決めモード（1=絶対, 2=相対）
-	if (motor.startPosition(steps, speed, 2)) {
+	if (motor->startPosition(steps, speed, 2)) {
 		printf("[%s] - Command sent successfully.\n", motorName.c_str());
 	}
 	else {
@@ -4575,9 +4591,9 @@ unsigned __stdcall mythread3(LPVOID lpx)
 				// ステップ数が0の場合は安全のため最小速度を設定
 				double return_speed = (steps_to_return > 0) ? (double)steps_to_return : 100.0;
 				// 逆回転 (-steps_to_return) を 算出速度(return_speed) で実行
-				std::thread thread_m1_rev(moveStepRelative, std::ref(*motor1), -steps_to_return, return_speed, "Motor1");
+				std::thread thread_m1_rev(moveStepRelative, motor1, -steps_to_return, return_speed, "Motor1");
 				g_ai_injection_done.store(true);
-				//std::thread thread_m1_rev(moveStepRelative, std::ref(*motor1), -100, 200, "Motor1");
+				//std::thread thread_m1_rev(moveStepRelative, motor1, -100, 200, "Motor1");
 				thread_m1_rev.detach();
 
 				// ★ 自動停止したら、AI制御モードも解除
@@ -4606,7 +4622,7 @@ unsigned __stdcall mythread3(LPVOID lpx)
 				if (current_speed2 != 100 || current_direction2 != 1) {
 					current_speed2 = 100;
 					current_direction2 = 1;
-					std::thread thread_m2_f(move, std::ref(*motor2), current_speed2, current_direction2, "Motor2");
+					std::thread thread_m2_f(move, motor2, current_speed2, current_direction2, "Motor2");
 					thread_m2_f.detach();
 					printf("Motor2 Forward\n");
 				}
@@ -4615,7 +4631,7 @@ unsigned __stdcall mythread3(LPVOID lpx)
 				if (current_speed2 != 100 || current_direction2 != 2) {
 					current_speed2 = 100;
 					current_direction2 = 2;
-					std::thread thread_m2_r(move, std::ref(*motor2), current_speed2, current_direction2, "Motor2");
+					std::thread thread_m2_r(move, motor2, current_speed2, current_direction2, "Motor2");
 					thread_m2_r.detach();
 					printf("Motor2 Reverse\n");
 				}
@@ -4624,7 +4640,7 @@ unsigned __stdcall mythread3(LPVOID lpx)
 				if (current_speed2 != 0) {
 					current_speed2 = 0;
 					current_direction2 = 0;
-					std::thread thread_m2_s(stop, std::ref(*motor2), "Motor2");
+					std::thread thread_m2_s(stop, motor2, "Motor2");
 					thread_m2_s.detach();
 					printf("Motor2 Stop\n");
 				}
@@ -4638,7 +4654,7 @@ unsigned __stdcall mythread3(LPVOID lpx)
 				if (current_speed1 != 50 || current_direction1 != 1) {
 					current_speed1 = 50;
 					current_direction1 = 1;
-					std::thread thread_m1_f(move, std::ref(*motor1), current_speed1, current_direction1, "Motor1");
+					std::thread thread_m1_f(move, motor1, current_speed1, current_direction1, "Motor1");
 					thread_m1_f.detach();
 					printf("Motor1 Forward\n");
 				}
@@ -4647,7 +4663,7 @@ unsigned __stdcall mythread3(LPVOID lpx)
 				if (current_speed1 != 50 || current_direction1 != 2) {
 					current_speed1 = 50;
 					current_direction1 = 2;
-					std::thread thread_m1_r(move, std::ref(*motor1), current_speed1, current_direction1, "Motor1");
+					std::thread thread_m1_r(move, motor1, current_speed1, current_direction1, "Motor1");
 					thread_m1_r.detach();
 					printf("Motor1 Reverse\n");
 				}
@@ -4656,7 +4672,7 @@ unsigned __stdcall mythread3(LPVOID lpx)
 				if (current_speed1 != 0) {
 					current_speed1 = 0;
 					current_direction1 = 0;
-					std::thread thread_m1_s(stop, std::ref(*motor1), "Motor1");
+					std::thread thread_m1_s(stop, motor1, "Motor1");
 					thread_m1_s.detach();
 					printf("Motor1 Stop\n");
 				}
@@ -4667,7 +4683,7 @@ unsigned __stdcall mythread3(LPVOID lpx)
 				if (current_speed2 != 100 || current_direction2 != 1) {
 					current_speed2 = 100;
 					current_direction2 = 1;
-					std::thread thread_m2_f(move, std::ref(*motor2), current_speed2, current_direction2, "Motor2");
+					std::thread thread_m2_f(move, motor2, current_speed2, current_direction2, "Motor2");
 					thread_m2_f.detach();
 					printf("Motor2 Forward\n");
 				}
@@ -4676,7 +4692,7 @@ unsigned __stdcall mythread3(LPVOID lpx)
 				if (current_speed2 != 100 || current_direction2 != 2) {
 					current_speed2 = 100;
 					current_direction2 = 2;
-					std::thread thread_m2_r(move, std::ref(*motor2), current_speed2, current_direction2, "Motor2");
+					std::thread thread_m2_r(move, motor2, current_speed2, current_direction2, "Motor2");
 					thread_m2_r.detach();
 					printf("Motor2 Reverse\n");
 				}
@@ -4685,7 +4701,7 @@ unsigned __stdcall mythread3(LPVOID lpx)
 				if (current_speed2 != 0) {
 					current_speed2 = 0;
 					current_direction2 = 0;
-					std::thread thread_m2_s(stop, std::ref(*motor2), "Motor2");
+					std::thread thread_m2_s(stop, motor2, "Motor2");
 					thread_m2_s.detach();
 					printf("Motor2 Stop\n");
 				}
@@ -4695,7 +4711,7 @@ unsigned __stdcall mythread3(LPVOID lpx)
 			if (GetAsyncKeyState(VK_F10) & 0x8000) {
 				if (current_speed1 == 0) { // 連続運転中でないことを確認
 					// moveStepRelative を別スレッドで実行
-					std::thread thread_f(moveStepRelative, std::ref(*motor1), g_step_count, g_step_speed, "Motor1");
+					std::thread thread_f(moveStepRelative, motor1, g_step_count, g_step_speed, "Motor1");
 					thread_f.detach();
 					std::this_thread::sleep_for(std::chrono::milliseconds(300)); // 重複入力防止
 				}
@@ -4705,7 +4721,7 @@ unsigned __stdcall mythread3(LPVOID lpx)
 			else if (GetAsyncKeyState(VK_F11) & 0x8000) {
 				if (current_speed1 == 0) {
 					// ステップ数にマイナス（-）をつけて逆転させる
-					std::thread thread_r(moveStepRelative, std::ref(*motor1), -g_step_count, g_step_speed_2, "Motor1");
+					std::thread thread_r(moveStepRelative, motor1, -g_step_count, g_step_speed_2, "Motor1");
 					thread_r.detach();
 					std::this_thread::sleep_for(std::chrono::milliseconds(300));
 				}
@@ -4717,10 +4733,10 @@ unsigned __stdcall mythread3(LPVOID lpx)
 		if (GetAsyncKeyState(VK_BACK) & 0x8000) {
 			std::cout << "!!! EMERGENCY STOP !!!" << std::endl;
 			// モーター1を即時停止
-			std::thread thread_stop1(stop, std::ref(*motor1), "Motor1");
+			std::thread thread_stop1(stop, motor1, "Motor1");
 			thread_stop1.detach();
 			// (必要であればモーター2も停止)
-			std::thread thread_stop2(stop, std::ref(*motor2), "Motor2");
+			std::thread thread_stop2(stop, motor2, "Motor2");
 			thread_stop2.detach();
 			// 誤動作防止のため少し待機
 			sleep(500);
@@ -8964,11 +8980,11 @@ void multithread_controll() {
 						// ★ [変更] 開始時は50ステップ移動
 						int start_steps = 70;
 						g_total_moved_steps.store(start_steps); // 積算ステップに50をセット
-						std::thread thread_m1_start(moveStepRelative, std::ref(*motor1), start_steps, g_step_speed, "Motor1");
+						std::thread thread_m1_start(moveStepRelative, motor1, start_steps, g_step_speed, "Motor1");
 						thread_m1_start.detach();
 
 						// 正方向に200ステップ移動
-						//std::thread thread_m1_start(moveStepRelative, std::ref(*motor1), 100, g_step_speed, "Motor1");
+						//std::thread thread_m1_start(moveStepRelative, motor1, 100, g_step_speed, "Motor1");
 						//thread_m1_start.detach();
 
 						g_ai_capture_request.store(false);
@@ -9062,7 +9078,7 @@ void multithread_controll() {
 							if (current_drive_count > 0 && current_drive_count % 50 == 0) {
 								int move_val = 15;
 								g_total_moved_steps.fetch_add(move_val); // 積算加算
-								std::thread t(moveStepRelative, std::ref(*motor1), move_val, g_step_speed, "Motor1");
+								std::thread t(moveStepRelative, motor1, move_val, g_step_speed, "Motor1");
 								t.detach();
 							}
 							g_ai_stop_counter.store(0); // 停止カウンタはリセット
@@ -9072,7 +9088,7 @@ void multithread_controll() {
 							if (current_drive_count > 0 && current_drive_count % 50 == 0) {
 								int move_val = 10;
 								g_total_moved_steps.fetch_add(move_val); // 積算加算
-								std::thread t(moveStepRelative, std::ref(*motor1), move_val, g_step_speed, "Motor1");
+								std::thread t(moveStepRelative, motor1, move_val, g_step_speed, "Motor1");
 								t.detach();
 							}
 							g_ai_stop_counter.store(0); // 停止カウンタはリセット
@@ -10164,22 +10180,35 @@ int main() {
 	sharedCtx = ModbusCVD::createSharedContext("COM5", 115200);
 	if (!sharedCtx) {
 		std::cerr << "Failed to create shared Modbus context" << std::endl;
-		// エラーメッセージを表示して終了
-		printf("Press any key to exit.");
-		_getch(); // ユーザーがキーを押すまで待機
-		return 1;
+		if (MODBUS_REQUIRED) {
+			// エラーメッセージを表示して終了
+			printf("Press any key to exit.");
+			_getch(); // ユーザーがキーを押すまで待機
+			return 1;
+		}
+		std::cerr << "[警告] Modbus（COM5）に接続できません。自動インジェクタのモータは使えませんが、起動を続けます。" << std::endl;
 	}
-	try {
-		motor1 = new ModbusCVD(sharedCtx, 1);  // スレーブID 1
-		motor2 = new ModbusCVD(sharedCtx, 2);  // スレーブID 2
-		std::cout << "Motor instances created successfully." << std::endl;
-	}
-	catch (const std::exception& e) {
-		std::cerr << "Exception occurred during motor initialization: " << e.what() << std::endl;
-		ModbusCVD::closeSharedContext(sharedCtx);
-		printf("Press any key to exit.");
-		_getch(); // ユーザーがキーを押すまで待機
-		return 1;
+	else {
+		try {
+			motor1 = new ModbusCVD(sharedCtx, 1);  // スレーブID 1
+			motor2 = new ModbusCVD(sharedCtx, 2);  // スレーブID 2
+			std::cout << "Motor instances created successfully." << std::endl;
+		}
+		catch (const std::exception& e) {
+			std::cerr << "Exception occurred during motor initialization: " << e.what() << std::endl;
+			delete motor1;
+			delete motor2;
+			motor1 = nullptr;
+			motor2 = nullptr;
+			ModbusCVD::closeSharedContext(sharedCtx);
+			sharedCtx = nullptr;
+			if (MODBUS_REQUIRED) {
+				printf("Press any key to exit.");
+				_getch(); // ユーザーがキーを押すまで待機
+				return 1;
+			}
+			std::cerr << "[警告] モータの初期化に失敗しました。自動インジェクタのモータは使えませんが、起動を続けます。" << std::endl;
+		}
 	}
 	loadAIModel("streaming_2stream_model_cpp.pt"); // ★ AIモデルをロード
 	//追加ここまで
@@ -10291,12 +10320,12 @@ int main() {
 	 // プログラム終了前にモーターを安全に停止させ、リソースを解放する
 	if (motor1) {
 		// stop関数を別スレッドで実行し、完了を待つ
-		std::thread thread_stop1(stop, std::ref(*motor1), "Motor1");
+		std::thread thread_stop1(stop, motor1, "Motor1");
 		thread_stop1.join();
 		delete motor1; // メモリ解放
 	}
 	if (motor2) {
-		std::thread thread_stop2(stop, std::ref(*motor2), "Motor2");
+		std::thread thread_stop2(stop, motor2, "Motor2");
 		thread_stop2.join();
 		delete motor2; // メモリ解放
 	}
