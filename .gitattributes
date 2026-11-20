@@ -1,0 +1,2 @@
+# 改行コード(CRLF)や Shift-JIS のバイト列を Git に変換させない
+* -text

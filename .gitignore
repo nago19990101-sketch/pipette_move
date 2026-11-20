@@ -1,0 +1,36 @@
+# Visual Studio の生成物
+.vs/
+ipch/
+*.sdf
+*.opensdf
+*.suo
+*.user
+*.aps
+*.ipch
+Debug/
+Release/
+x64/
+# NuGet（packages.config から復元できる）
+packages/
+RCa*
+
+# 大きいバイナリ・実行時データ（GitHub に置かない）
+*.dll
+*.pt
+*.onnx
+*.mp4
+*.csv
+*.png
+*.jpg
+garubano2/bin/
+# bin_xiApi はリンクに使う .lib だけ残す
+garubano2/bin_xiApi/*
+!garubano2/bin_xiApi/*.lib
+garubano2/holdingpipette_img/
+garubano2/injectionpipette_img/
+garubano2/logging/
+garubano2/_REC*/
+__recording/
+
+# 手動バックアップ（今後は Git の履歴で管理する）
+cpp_backup/
